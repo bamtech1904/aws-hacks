@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation Template for EC2
+# ------------------------------------- #
+# Metadata
+# ------------------------------------- #
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Parameter Group Set
+        Parameters:
+          - Project
+          - Env
+          - ImageId
+          - InstanceType
+# ------------------------------------- #
+# Parameters
+# ------------------------------------- #
+Parameters:
+  # General
+  Project:
+    Type: String
+    Default: tenkura
+  Env:
+    Type: String
+    Default: dev
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  InstanceType:
+    Description: select EC2 instance type.
+    Type: String
+    Default: t2.micro
+
+# ------------------------------------- #
+# Resources
+# ------------------------------------- #
+Resources:
+  # ------------------------------
+  # Security Group
+  # ------------------------------
+  # for ALB
+  SecurityGroup01:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Project}-${Env}-alb-sg
+      GroupDescription: Security Group for ALB
+      VpcId: 
+        "Fn::ImportValue": !Sub "${Project}-${Env}-vpc-id"
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: All http access allowed}
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0}
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-${Env}-alb-sg
+        - Key: Project
+          Value: !Ref Project
+        - Key: Env
+          Value: !Ref Env
+  # for EC2
+  SecurityGroup02:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${Project}-${Env}-app-sg
+      GroupDescription: Security Group for EC2
+      VpcId:
+        "Fn::ImportValue": !Sub "${Project}-${Env}-vpc-id"
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref SecurityGroup01, Description: All http access allowed from alb}
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-${Env}-app-sg
+        - Key: Project
+          Value: !Ref Project
+        - Key: Env
+          Value: !Ref Env
+
+
+  # ------------------------------
+  # IAM
+  # ------------------------------
+  # IAM Role
+  ServerRole1:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      RoleName: !Sub ${Project}-${Env}-app-role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+  IAMServerProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ServerRole1
+      InstanceProfileName: !Sub ${Project}-${Env}-app-role
+
+  # ------------------------------
+  # ELB
+  # ------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${Project}-${Env}-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: 
+        - Fn::ImportValue:
+            !Sub "${Project}-${Env}-public-subnet-1a-id"
+        - Fn::ImportValue:
+            !Sub "${Project}-${Env}-public-subnet-1c-id"
+      SecurityGroups: 
+        - !Ref SecurityGroup01
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-${Env}-alb
+        - Key: Project
+          Value: !Ref Project
+        - Key: Env
+          Value: !Ref Env
+  Listener01:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: 
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: 
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup01
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+  TargetGroup01:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      TargetType: instance
+      Name: !Sub ${Project}-${Env}-tg
+      Protocol: HTTP
+      Port: 80
+      VpcId:
+        "Fn::ImportValue": !Sub "${Project}-${Env}-vpc-id"
+      ProtocolVersion: HTTP1
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /index.html
+      HealthCheckPort: traffic-port
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 10
+      HealthCheckIntervalSeconds: 30
+      IpAddressType: ipv4
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-${Env}-tg
+        - Key: Project
+          Value: !Ref Project
+        - Key: Env
+          Value: !Ref Env
+
+  # ------------------------------
+  # Launch Template
+  # ------------------------------
+  LaunchTemplate1:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${Project}-${Env}-app-lt
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        IamInstanceProfile:
+          Arn: !GetAtt IAMServerProfile.Arn
+        InstanceType: !Ref InstanceType
+        Monitoring:
+          Enabled: false
+        SecurityGroupIds:
+          - !Ref SecurityGroup02
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum -y install httpd
+            yum -y install ruby
+            yum -y install wget
+
+            # setup apache
+            systemctl enable httpd
+            systemctl start httpd
+            chown apache:apache -R /var/www/html
+
+            # setup codedeploy-agent
+            wget https://aws-codedeploy-ap-northeast-1.s3.ap-northeast-1.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            sudo service codedeploy-agent start
+
+  # ------------------------------
+  # AutoScaling
+  # ------------------------------
+  AutoScalingGroup1:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AutoScalingGroupName: !Sub ${Project}-${Env}-app-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate1
+        Version: !GetAtt LaunchTemplate1.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            !Sub "${Project}-${Env}-private-subnet-1a-id"
+        - Fn::ImportValue:
+            !Sub "${Project}-${Env}-private-subnet-1c-id"
+      # 紐づけるTargetGroup
+      TargetGroupARNs:
+        - !Ref TargetGroup01
+      # ヘルスチェックタイプ
+      HealthCheckType: ELB
+      # Health check grace period
+      HealthCheckGracePeriod: 60
+      # 台数設定
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      # スケールイン保護の設定
+      NewInstancesProtectedFromScaleIn: False
+      # CloudWatchメトリクス収集間隔
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-${Env}-app-asg
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref Project
+          PropagateAtLaunch: true
+        - Key: Env
+          Value: !Ref Env
+          PropagateAtLaunch: true

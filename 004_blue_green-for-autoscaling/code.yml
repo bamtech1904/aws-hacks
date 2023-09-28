@@ -1,0 +1,603 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation Tamplate Code Series
+# ------------------------------------- #
+# Metadata
+# ------------------------------------- #
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Parameter Group Set
+        Parameters:
+          - Project
+          - Env
+# ------------------------------------- #
+# Parameters
+# ------------------------------------- #
+Parameters:
+  # General
+  Project:
+    Type: String
+    Default: tenkura
+  Env:
+    Type: String
+    Default: dev
+
+# -------------------------------------
+# Resources
+# -------------------------------------
+Resources: 
+# ------------------
+# S3 Artifact Buckets
+# ------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${Project}-${Env}-artifact
+      AccessControl: Private
+
+# ------------------
+# CodeCommit
+# ------------------
+  Repository1:
+    Type: AWS::CodeCommit::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties: 
+      RepositoryName: !Sub ${Project}-${Env}-app-repo
+      RepositoryDescription: hands on for Blue/Green AutoScaling Deployment Practices.
+      Tags:
+        - Key: Name
+          Value: !Sub ${Project}-${Env}-app-repo
+        - Key: Project
+          Value: !Ref Project
+        - Key: Env
+          Value: !Ref Env
+
+# ------------------
+# CodeDeploy for EC2 AutoScaling B/G
+# ------------------
+  #-- Lambda Function(CodeDeploy作成用関数) --
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import json
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          deploy = boto3.client("codedeploy")
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Main Function
+          def lambda_handler(event, context):
+              # 変数宣言
+              try:
+                  params = {
+                      'appName': event['ResourceProperties']['appName'],
+                      'deploymentGroup': event['ResourceProperties']['deploymentGroup'],
+                      'autoScalingGroups': event['ResourceProperties']['autoScalingGroups'],
+                      'serviceRoleArn': event['ResourceProperties']['serviceRoleArn'],
+                      'deploymentConfigName': event['ResourceProperties']['deploymentConfigName'],
+                      'targetGroupName': event['ResourceProperties']['targetGroupName']
+                  }
+                  print('REQUEST RECEIVED:\n' + json.dumps(event))
+
+                  # レスポンスステータスに応じて処理内容を分岐
+                  if event['RequestType'] == 'Create':
+                      create_app(**params)
+                      create_deploy(**params)
+                  elif event['RequestType'] == 'Update':
+                      if bool(event['OldResourceProperties']['appName']): # and bool(params['deploymentGroupOld'])
+                        params['appNameOld'] = event['OldResourceProperties']['appName']
+                        params['deploymentGroupOld'] = event['OldResourceProperties']['deploymentGroup']
+                        params['autoScalingGroupsOld'] = event['OldResourceProperties']['autoScalingGroups']
+                        params['serviceRoleArnOld'] = event['OldResourceProperties']['serviceRoleArn']
+                        params['deploymentConfigNameOld'] = event['OldResourceProperties']['deploymentConfigName']
+                        params['targetGroupNameOld'] = event['OldResourceProperties']['targetGroupName']
+                        params['updateVersion'] = event['OldResourceProperties']['updateVersion']
+                        update_app(**params)
+                        update_deploy(**params)
+                      else:
+                        create_app(**params)
+                        create_deploy(**params)
+                  elif event['RequestType'] == 'Delete':
+                      delete_app(params)
+                      delete_deploy(params)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, 'PhysicalResourceID')
+              except ClientError as e:
+                  logger.error("ERROR: Oops! Something error!")
+                  logger.error(e)
+                  responseData = {'error': str(e)}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, 'PhysicalResourceID')
+
+          # Create Application
+          def create_app(**params):
+                  res = deploy.create_application(
+                      applicationName=params['appName'],
+                      computePlatform='Server',
+                      tags=[
+                          {
+                              'Key': 'Name',
+                              'Value': params['appName']
+                          },
+                      ]
+                  )
+                  logger.info(res)
+                  logger.info("SUCCESS: CodeDeploy Application created.")
+
+          # Create DeploymentGroup
+          def create_deploy(**params):
+                  res = deploy.create_deployment_group(
+                      applicationName=params['appName'],
+                      deploymentGroupName=params['deploymentGroup'],
+                      autoScalingGroups=[
+                          params['autoScalingGroups'],
+                      ],
+                      deploymentConfigName=params['deploymentConfigName'],
+                      serviceRoleArn=params['serviceRoleArn'],
+                      autoRollbackConfiguration={
+                          'enabled': True,
+                          'events': [
+                              'DEPLOYMENT_FAILURE',
+                          ]
+                      },
+                      deploymentStyle={
+                          'deploymentType': 'BLUE_GREEN',
+                          'deploymentOption': 'WITH_TRAFFIC_CONTROL'
+                      },
+                      outdatedInstancesStrategy='UPDATE',
+                      blueGreenDeploymentConfiguration={
+                          'terminateBlueInstancesOnDeploymentSuccess': {
+                              'action': 'TERMINATE',
+                              'terminationWaitTimeInMinutes': 10
+                          },
+                          'deploymentReadyOption': {
+                              'actionOnTimeout': 'CONTINUE_DEPLOYMENT',
+                              'waitTimeInMinutes': 0
+                          },
+                          'greenFleetProvisioningOption': {
+                              'action': 'COPY_AUTO_SCALING_GROUP'
+                          }
+                      },
+                      loadBalancerInfo={
+                          'targetGroupInfoList': [
+                              {
+                                  'name': params['targetGroupName']
+                              },
+                          ]
+                      },
+                      tags=[
+                          {
+                              'Key': 'Name',
+                              'Value': params['appName']
+                          },
+                      ]
+                  )
+                  logger.info(res)
+                  logger.info("SUCCESS: CodeDeploy Deployment Group created.")
+
+          # Update Application
+          def update_app(**params):
+                  if params['appName'] != params['appNameOld']:
+                      res = deploy.update_application(
+                          applicationName=params['appNameOld'],
+                          newApplicationName=params['appName']
+                      )
+                      logger.info(res)
+                      logger.info("SUCCESS: CodeDeploy Application updated.")
+                  else:
+                      logger.info("No need to update the application.")
+
+          # Update DeploymentGroup
+          def update_deploy(**params):
+                  res = deploy.update_deployment_group(
+                      applicationName=params['appName'],
+                      currentDeploymentGroupName=params['deploymentGroupOld'],
+                      newDeploymentGroupName=params['deploymentGroup'],
+                      deploymentConfigName=params['deploymentConfigName'],
+                      autoScalingGroups=[
+                          params['autoScalingGroups'],
+                      ],
+                      serviceRoleArn=params['serviceRoleArn'],
+                      autoRollbackConfiguration={
+                          'enabled': True,
+                          'events': [
+                              'DEPLOYMENT_FAILURE',
+                          ]
+                      },
+                      deploymentStyle={
+                          'deploymentType': 'BLUE_GREEN',
+                          'deploymentOption': 'WITH_TRAFFIC_CONTROL'
+                      },
+                      outdatedInstancesStrategy='UPDATE',
+                      blueGreenDeploymentConfiguration={
+                          'terminateBlueInstancesOnDeploymentSuccess': {
+                              'action': 'TERMINATE',
+                              'terminationWaitTimeInMinutes': 10
+                          },
+                          'deploymentReadyOption': {
+                              'actionOnTimeout': 'CONTINUE_DEPLOYMENT',
+                              'waitTimeInMinutes': 0
+                          },
+                          'greenFleetProvisioningOption': {
+                              'action': 'COPY_AUTO_SCALING_GROUP'
+                          }
+                      },
+                      loadBalancerInfo={
+                          'targetGroupInfoList': [
+                              {
+                                  'name': params['targetGroupName']
+                              },
+                          ]
+                      },
+                  )
+                  logger.info(res)
+                  logger.info("SUCCESS: CodeDeploy Deployment Group updated.")
+
+          # Delete Application
+          def delete_app(params):
+                  res = deploy.delete_application(applicationName=params['appName'])
+                  logger.info(res)
+                  logger.info("SUCCESS: CodeDeploy Application deleted.")
+
+          # Delete DeploymentGroup
+          def delete_deploy(params):
+                  res = deploy.delete_deployment_group(
+                      applicationName=params['appName'],
+                      deploymentGroupName=params['deploymentGroup']
+                  )
+                  logger.info(res)
+                  logger.info("SUCCESS: CodeDeploy Deployment Group deleted.")
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 10
+  #-- Custom Resource --
+  # 以下に作成するCodeDeployのパラメータを指定
+  CreateCodeDeploy:
+    Type: Custom::CreateCodeDeploy
+    DependsOn:
+      - LambdaRole
+      - LambdaPolicy
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      Region: !Ref AWS::Region
+      autoScalingGroups: !Sub ${Project}-${Env}-app-asg
+      deploymentConfigName: CodeDeployDefault.AllAtOnce
+      serviceRoleArn: !GetAtt CodeDeployRole.Arn
+      targetGroupName: !Sub ${Project}-${Env}-tg
+      appName: !Sub ${Project}-${Env}-app
+      deploymentGroup: !Sub ${Project}-${Env}-deploy
+      # Lambdaコード更新時は以下をカウントアップさせる
+      updateVersion: '0'
+  #-- IAMRole For CustomResource Lambda --
+  # Lambda関数実行用ロール
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSCodeDeployFullAccess
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:*
+              - logs:*
+            Resource: '*'
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - iam:PassRole
+            Condition:
+              StringEqualsIfExists:
+                iam:PassedToService:
+                  - codedeploy.amazonaws.com
+      Roles:
+        - !Ref LambdaRole
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-${Env}-deploy-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Policies:
+        - PolicyName: !Sub ${Project}-${Env}-deploy-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: CodeDeployAutoScaling
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - ec2:CreateTags
+                  - ec2:RunInstances
+                Resource:
+                  - '*'
+
+# ------------------
+# CodePipeline
+# ------------------
+  Pipeline1:
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      Name: !Sub ${Project}-${Env}-pipeline
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref ArtifactBucket
+      RoleArn: !GetAtt CodePipelineServiceRole1.Arn
+      Stages: 
+        - 
+          Name: Source 
+          Actions: 
+            - 
+              Name: SourceAction
+              ActionTypeId: 
+                Category: Source 
+                Owner: AWS 
+                Version: 1 
+                Provider: CodeCommit 
+              OutputArtifacts: 
+                - 
+                  Name: SourceArtifact 
+              Configuration: 
+                BranchName: main
+                OutputArtifactFormat: CODE_ZIP 
+                PollForSourceChanges: false 
+                RepositoryName: !GetAtt Repository1.Name
+              RunOrder: 1 
+              Region: ap-northeast-1
+              Namespace: SourceVariables
+        - 
+          Name: Deploy 
+          Actions: 
+            - 
+              Name: DeployAction
+              ActionTypeId: 
+                Category: Deploy 
+                Owner: AWS 
+                Version: 1
+                Provider: CodeDeploy 
+              RunOrder: 1 
+              Configuration: 
+                ApplicationName: !Sub ${Project}-${Env}-app
+                DeploymentGroupName: !Sub ${Project}-${Env}-deploy
+              InputArtifacts: 
+                - Name: SourceArtifact 
+              Region: ap-northeast-1
+              Namespace: DeployVariables
+    DependsOn:
+      - CreateCodeDeploy
+  CodePipelineServiceRole1:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-${Env}-pipeline-role
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${Project}-${Env}-pipeline-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:BatchGet*
+                  - codebuild:Get*
+                  - codebuild:List*
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:ListBranches
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                  - codecommit:CancelUploadArchive
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                  - s3:GetBucketLocation
+                  - s3:ListAllMyBuckets
+                  - iam:PassRole
+                Condition:
+                  StringEqualsIfExists:
+                    'iam:PassedToService':
+                      - cloudformation.amazonaws.com
+                      - elasticbeanstalk.amazonaws.com
+                      - ec2.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - elasticbeanstalk:*
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - autoscaling:*
+                  - cloudwatch:*
+                  - s3:*
+                  - sns:*
+                  - cloudformation:*
+                  - rds:*
+                  - sqs:*
+                  - ecs:*
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:ListFunctions
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - opsworks:CreateDeployment
+                  - opsworks:DescribeApps
+                  - opsworks:DescribeCommands
+                  - opsworks:DescribeDeployments
+                  - opsworks:DescribeInstances
+                  - opsworks:DescribeStacks
+                  - opsworks:UpdateApp
+                  - opsworks:UpdateStack
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuildBatches
+                  - codebuild:StartBuildBatch
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - devicefarm:ListProjects
+                  - devicefarm:ListDevicePools
+                  - devicefarm:GetRun
+                  - devicefarm:GetUpload
+                  - devicefarm:CreateUpload
+                  - devicefarm:ScheduleRun
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - servicecatalog:ListProvisioningArtifacts
+                  - servicecatalog:CreateProvisioningArtifact
+                  - servicecatalog:DescribeProvisioningArtifact
+                  - servicecatalog:DeleteProvisioningArtifact
+                  - servicecatalog:UpdateProduct
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                  - states:StartExecution
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - appconfig:StartDeployment
+                  - appconfig:StopDeployment
+                  - appconfig:GetDeployment
+              - Resource: "arn:aws:ssm:*:*:parameter/CodeBuild/*"
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+
+# ------------------
+# EventBridge
+# ------------------
+  EventRule01:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Amazon EventBridge rule to automatically start your pipeline.
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt Repository1.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Name: !Sub ${Project}-${Env}-deploy-rule
+      Targets: 
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline1}
+          Id: CodePipeline-CodeCommit
+          RoleArn: !GetAtt EventsRuleRole.Arn
+  EventsRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${Project}-${Env}-deploy-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}${Pipeline1}"
