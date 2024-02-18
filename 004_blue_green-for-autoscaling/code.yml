@@ -6,8 +6,7 @@ Description: CloudFormation Tamplate Code Series
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
-      -
-        Label:
+      - Label:
           default: Parameter Group Set
         Parameters:
           - Project
@@ -27,10 +26,10 @@ Parameters:
 # -------------------------------------
 # Resources
 # -------------------------------------
-Resources: 
-# ------------------
-# S3 Artifact Buckets
-# ------------------
+Resources:
+  # ------------------
+  # S3 Artifact Buckets
+  # ------------------
   ArtifactBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -39,14 +38,14 @@ Resources:
       BucketName: !Sub ${Project}-${Env}-artifact
       AccessControl: Private
 
-# ------------------
-# CodeCommit
-# ------------------
+  # ------------------
+  # CodeCommit
+  # ------------------
   Repository1:
     Type: AWS::CodeCommit::Repository
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
-    Properties: 
+    Properties:
       RepositoryName: !Sub ${Project}-${Env}-app-repo
       RepositoryDescription: hands on for Blue/Green AutoScaling Deployment Practices.
       Tags:
@@ -57,12 +56,12 @@ Resources:
         - Key: Env
           Value: !Ref Env
 
-# ------------------
-# CodeDeploy for EC2 AutoScaling B/G
-# ------------------
+  # ------------------
+  # CodeDeploy for EC2 AutoScaling B/G
+  # ------------------
   #-- Lambda Function(CodeDeploy作成用関数) --
   LambdaFunction:
-    Type: 'AWS::Lambda::Function'
+    Type: "AWS::Lambda::Function"
     Properties:
       Code:
         ZipFile: |
@@ -73,6 +72,7 @@ Resources:
           from botocore.exceptions import ClientError
 
           deploy = boto3.client("codedeploy")
+          autoscaling = boto3.client("autoscaling")
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
@@ -221,7 +221,7 @@ Resources:
                       blueGreenDeploymentConfiguration={
                           'terminateBlueInstancesOnDeploymentSuccess': {
                               'action': 'TERMINATE',
-                              'terminationWaitTimeInMinutes': 10
+                              'terminationWaitTimeInMinutes': 5
                           },
                           'deploymentReadyOption': {
                               'actionOnTimeout': 'CONTINUE_DEPLOYMENT',
@@ -256,6 +256,7 @@ Resources:
                   )
                   logger.info(res)
                   logger.info("SUCCESS: CodeDeploy Deployment Group deleted.")
+
       Handler: index.lambda_handler
       Role: !GetAtt LambdaRole.Arn
       Runtime: python3.9
@@ -277,14 +278,14 @@ Resources:
       appName: !Sub ${Project}-${Env}-app
       deploymentGroup: !Sub ${Project}-${Env}-deploy
       # Lambdaコード更新時は以下をカウントアップさせる
-      updateVersion: '0'
+      updateVersion: "1"
   #-- IAMRole For CustomResource Lambda --
   # Lambda関数実行用ロール
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -300,15 +301,15 @@ Resources:
     Properties:
       PolicyName: LambdaPolicy
       PolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Action:
               - ec2:*
               - logs:*
-            Resource: '*'
+            Resource: "*"
           - Effect: Allow
-            Resource: '*'
+            Resource: "*"
             Action:
               - iam:PassRole
             Condition:
@@ -344,57 +345,52 @@ Resources:
                   - ec2:CreateTags
                   - ec2:RunInstances
                 Resource:
-                  - '*'
+                  - "*"
 
-# ------------------
-# CodePipeline
-# ------------------
+  # ------------------
+  # CodePipeline
+  # ------------------
   Pipeline1:
     Type: AWS::CodePipeline::Pipeline
-    Properties: 
+    Properties:
       Name: !Sub ${Project}-${Env}-pipeline
-      ArtifactStore: 
+      ArtifactStore:
         Type: S3
         Location: !Ref ArtifactBucket
       RoleArn: !GetAtt CodePipelineServiceRole1.Arn
-      Stages: 
-        - 
-          Name: Source 
-          Actions: 
-            - 
-              Name: SourceAction
-              ActionTypeId: 
-                Category: Source 
-                Owner: AWS 
-                Version: 1 
-                Provider: CodeCommit 
-              OutputArtifacts: 
-                - 
-                  Name: SourceArtifact 
-              Configuration: 
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
                 BranchName: main
-                OutputArtifactFormat: CODE_ZIP 
-                PollForSourceChanges: false 
+                OutputArtifactFormat: CODE_ZIP
+                PollForSourceChanges: false
                 RepositoryName: !GetAtt Repository1.Name
-              RunOrder: 1 
+              RunOrder: 1
               Region: ap-northeast-1
               Namespace: SourceVariables
-        - 
-          Name: Deploy 
-          Actions: 
-            - 
-              Name: DeployAction
-              ActionTypeId: 
-                Category: Deploy 
-                Owner: AWS 
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
                 Version: 1
-                Provider: CodeDeploy 
-              RunOrder: 1 
-              Configuration: 
+                Provider: CodeDeploy
+              RunOrder: 1
+              Configuration:
                 ApplicationName: !Sub ${Project}-${Env}-app
                 DeploymentGroupName: !Sub ${Project}-${Env}-deploy
-              InputArtifacts: 
-                - Name: SourceArtifact 
+              InputArtifacts:
+                - Name: SourceArtifact
               Region: ap-northeast-1
               Namespace: DeployVariables
     DependsOn:
@@ -441,7 +437,7 @@ Resources:
                   - iam:PassRole
                 Condition:
                   StringEqualsIfExists:
-                    'iam:PassedToService':
+                    "iam:PassedToService":
                       - cloudformation.amazonaws.com
                       - elasticbeanstalk.amazonaws.com
                       - ec2.amazonaws.com
@@ -551,12 +547,12 @@ Resources:
                 Action:
                   - ssm:PutParameter
 
-# ------------------
-# EventBridge
-# ------------------
+  # ------------------
+  # EventBridge
+  # ------------------
   EventRule01:
     Type: AWS::Events::Rule
-    Properties: 
+    Properties:
       Description: Amazon EventBridge rule to automatically start your pipeline.
       EventBusName: default
       EventPattern:
@@ -575,7 +571,7 @@ Resources:
           referenceName:
             - main
       Name: !Sub ${Project}-${Env}-deploy-rule
-      Targets: 
+      Targets:
         - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline1}
           Id: CodePipeline-CodeCommit
           RoleArn: !GetAtt EventsRuleRole.Arn
@@ -600,4 +596,4 @@ Resources:
                 Action:
                   - codepipeline:StartPipelineExecution
                 Resource:
-                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}${Pipeline1}"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline1}"
